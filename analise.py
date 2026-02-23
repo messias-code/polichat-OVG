@@ -1,7 +1,6 @@
 import pandas as pd
 import numpy as np
 import os
-import datetime
 
 PASTA_DOWNLOADS = os.path.join(os.getcwd(), "downloads")
 ARQUIVO_CSV = os.path.join(PASTA_DOWNLOADS, "relatorio_chats_atualizado.csv")
@@ -37,18 +36,15 @@ def analisar_e_limpar_dados():
         # ========================================================
         horas = dt_chegada.dt.hour
         
-        # Turnos ajustados: Madrugada (00h-05h59), Manhã (06h-11h59), Tarde (12h-17h59), Noite (18h-23h59)
         df['Período do Dia'] = np.select(
             [(horas >= 0) & (horas < 6), (horas >= 6) & (horas < 12), (horas >= 12) & (horas < 18), (horas >= 18) & (horas <= 23)],
             ['Madrugada', 'Manhã', 'Tarde', 'Noite'], default='Desconhecido'
         )
 
-        # Expediente exato: 08:01 às 17:59 (Segunda a Sexta)
         def verificar_expediente(dt):
             if pd.isna(dt): return "Desconhecido"
-            if dt.dayofweek >= 5: return "NÃO (Fim de Semana)" # 5=Sábado, 6=Domingo
+            if dt.dayofweek >= 5: return "NÃO (Fim de Semana)" 
             
-            # Converte a hora da chegada para minutos totais no dia para facilitar a matemática
             minutos_do_dia = dt.hour * 60 + dt.minute
             inicio_expediente = 8 * 60 + 1  # 08:01
             fim_expediente = 17 * 60 + 59   # 17:59
@@ -62,13 +58,28 @@ def analisar_e_limpar_dados():
         # ========================================================
         # 4. AVALIAÇÃO DA FILA E DO ATENDIMENTO (O Cronómetro)
         # ========================================================
-        def avaliar_espera(row, data_chegada, data_resposta):
+        def avaliar_espera(row, data_chegada, data_resposta, data_fim):
+            # NOVO: LÓGICA DE QUEM FOI IGNORADO
             if pd.isna(data_resposta): 
-                return "Sem Resposta (Não Avaliado)"
-            
+                if pd.isna(data_fim):
+                    return "⏳ Na Fila (Ainda em Aberto)"
+                
+                # Se foi fechado sem resposta, calcula quanto tempo o cliente ficou no vácuo
+                delta_vacuo = (data_fim - data_chegada).total_seconds()
+                if data_fim.date() > data_chegada.date():
+                    return "⚠️ Vácuo até o Dia Seguinte (Fechado sem resposta)"
+                
+                minutos_vacuo = delta_vacuo / 60
+                
+                # Diferencia se foi o robô que fechou ou se foi um humano que ignorou
+                if pd.isna(row.get('Atendente')) or str(row.get('Atendente')).strip() == '':
+                    return f"🤖 Sistema/Robô (Encerrado após {int(minutos_vacuo)} min)"
+                else:
+                    return f"👻 Vácuo Total (Fechado após {int(minutos_vacuo)} min)"
+
+            # LÓGICA NORMAL DE QUEM FOI RESPONDIDO
             delta = (data_resposta - data_chegada).total_seconds()
             
-            # Verifica se virou o dia na fila
             if data_resposta.date() > data_chegada.date(): 
                 return "⚠️ Passou para o Dia Seguinte"
             
@@ -77,19 +88,17 @@ def analisar_e_limpar_dados():
             elif minutos <= 15: return "🟡 Aceitável (5 a 15 min)"
             else: return "🟠 Demorado (> 15 min)"
             
-        df['Avaliação da Espera'] = [avaliar_espera(row, c, r) for row, c, r in zip(df.to_dict('records'), dt_chegada, dt_resposta)]
+        df['Avaliação da Espera'] = [avaliar_espera(row, c, r, f) for row, c, r, f in zip(df.to_dict('records'), dt_chegada, dt_resposta, dt_fim)]
 
-        # O NOVO DIAGNÓSTICO DE CONVERSA (Baseado em Tempo, não em mensagens)
         def diagnosticar_conversa(row, resp, fim):
             if pd.isna(row.get('Atendente')): 
                 return "🤖 Retido no Robô"
             if pd.isna(resp): 
                 return "👻 Ignorado (Atendente nunca respondeu)"
             
-            # Se tem resposta e tem fim, vamos ver quanto tempo durou
             if pd.notna(fim):
                 tempo_conversa_seg = (fim - resp).total_seconds()
-                if tempo_conversa_seg < 60: # Durou menos de 1 minuto
+                if tempo_conversa_seg < 60: 
                     return "⚡ Fechamento Imediato (Sem diálogo longo)"
                 else:
                     return "✅ Atendimento com Interação"
@@ -101,10 +110,21 @@ def analisar_e_limpar_dados():
         df['Status Final'] = np.where(dt_fim.notna(), "Encerrado", "Em Aberto")
 
         # ========================================================
-        # 5. CÁLCULO EXATO DE TEMPOS (HH:MM:SS)
+        # 5. CÁLCULO EXATO DE TEMPOS (A NOVA LÓGICA MATADORA)
         # ========================================================
-        df['Tempo de Espera (Fila)'] = (dt_resposta - dt_chegada).apply(formatar_tempo_exato)
-        df['Tempo de Conversa (Atendimento)'] = (dt_fim - dt_resposta).apply(formatar_tempo_exato)
+        # Se teve 1ª Resposta, mede até ela. Se não teve, mede até o Encerramento!
+        data_limite_espera = dt_resposta.fillna(dt_fim)
+        
+        df['Tempo de Espera (Fila)'] = (data_limite_espera - dt_chegada).apply(formatar_tempo_exato)
+        
+        # O Tempo de Conversa só existe se realmente houve conversa (1ª Resposta não nula)
+        # Caso contrário, fica vazio, pois a pessoa apenas esperou na fila até fecharem.
+        df['Tempo de Conversa (Atendimento)'] = np.where(
+            dt_resposta.notna(), 
+            (dt_fim - dt_resposta).apply(formatar_tempo_exato), 
+            ""
+        )
+        
         df['Tempo Total (Início ao Fim)'] = (dt_fim - dt_chegada).apply(formatar_tempo_exato)
 
         # ========================================================
@@ -210,7 +230,7 @@ def analisar_e_limpar_dados():
                 ws.set_column(i, i, largura)
 
         writer.close()
-        print(f"🎉 SUCESSO! A base de dados focada em Tempos está pronta!")
+        print(f"🎉 SUCESSO! A base de dados agora cobre os casos de vácuo perfeitamente.")
         print(f"Abra o ficheiro em: {ARQUIVO_EXCEL}")
 
     except Exception as e:
