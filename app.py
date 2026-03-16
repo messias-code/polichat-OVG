@@ -29,9 +29,12 @@ ARQUIVO_EXCEL = os.path.join(DOWNLOAD_PATH, "relatorio_chats_pronto.xlsx")
 def formatar_tempo_exato(td):
     if pd.isna(td): return ""
     segundos_totais = max(0, int(td.total_seconds()))
-    horas, resto = divmod(segundos_totais, 3600)
+    
+    dias, resto_dias = divmod(segundos_totais, 86400)
+    horas, resto = divmod(resto_dias, 3600)
     minutos, segundos = divmod(resto, 60)
-    return f"{horas:02d}:{minutos:02d}:{segundos:02d}"
+    
+    return f"{dias}.{horas:02d}:{minutos:02d}:{segundos:02d}"
 
 def limpar_pasta_downloads():
     os.makedirs(DOWNLOAD_PATH, exist_ok=True)
@@ -50,11 +53,8 @@ def extrair_relatorio_metabase():
     print("="*50)
     
     chrome_options = Options()
-    
-    # 🔥 MODO FANTASMA CORRIGIDO
     chrome_options.add_argument('--headless=new')
-    chrome_options.add_argument('--window-size=1920,1080') # Substitui o start-maximized
-    
+    chrome_options.add_argument('--window-size=1920,1080')
     chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36')
     chrome_options.add_argument('--disable-notifications') 
     chrome_options.add_argument('--ignore-certificate-errors')
@@ -66,12 +66,7 @@ def extrair_relatorio_metabase():
     })
 
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
-    
-    # Comando de baixo nível (CDP) para forçar downloads silenciosos
-    driver.execute_cdp_cmd('Page.setDownloadBehavior', {
-        'behavior': 'allow',
-        'downloadPath': DOWNLOAD_PATH
-    })
+    driver.execute_cdp_cmd('Page.setDownloadBehavior', {'behavior': 'allow', 'downloadPath': DOWNLOAD_PATH})
     
     wait = WebDriverWait(driver, 60)
     actions = ActionChains(driver)
@@ -88,18 +83,15 @@ def extrair_relatorio_metabase():
     try:
         driver.get("https://app-spa.poli.digital/login")
         
-        # 1. LOGIN
         wait.until(EC.presence_of_element_located((By.XPATH, '//*[@id="root"]/div/div/div/div/div[2]/div/form/input'))).send_keys(LOGIN_USER)
         driver.find_element(By.XPATH, '//*[@id="root"]/div/div/div/div/div[2]/div/form/div[3]/div/input').send_keys(PASSWORD_USER)
         clicar_js('//*[@id="root"]/div/div/div/div/div[2]/div/form/div[6]/button', "Botão Entrar", delay=2)
 
-        # 2. NAVEGAÇÃO
         clicar_js('//*[@id="sidebar"]/div[1]/li[5]/a/div', "Menu Relatórios", delay=2)
         print("⏳ A entrar no ambiente do Metabase (Invisível)...")
         iframe = wait.until(EC.presence_of_element_located((By.XPATH, "//iframe[@title='Metabase Dashboard']")))
         driver.switch_to.frame(iframe)
 
-        # 3. FILTRAGEM (ANO INTEIRO)
         clicar_js('//*[@id="2-T-138"]/span', "Aba Visão Geral")
         clicar_js("//button[contains(., 'Data - Período')]", "Filtro de Data")
         clicar_js("//button[contains(., 'Atual')] | //*[text()='Atual']", "Opção 'Atual'")
@@ -108,7 +100,6 @@ def extrair_relatorio_metabase():
         print("⏳ A aguardar o Metabase processar os dados de UM ANO (15s)...")
         time.sleep(15) 
 
-        # 4. ROLAGEM E HOVER
         print("📜 A localizar a tabela 'Relatório de chats'...")
         xpath_titulo = "//*[contains(text(), 'Relátorio de chats') or contains(text(), 'Relatório de chats')]"
         titulo_tabela = wait.until(EC.presence_of_element_located((By.XPATH, xpath_titulo)))
@@ -118,7 +109,6 @@ def extrair_relatorio_metabase():
         actions.move_to_element(titulo_tabela).perform() 
         time.sleep(1) 
 
-        # 5. MENU OPÇÕES E DOWNLOAD
         xpath_opcoes = xpath_titulo + "/ancestor::div[contains(@class, 'react-grid-item')]//button[@data-testid='public-or-embedded-dashcard-menu']"
         clicar_js(xpath_opcoes, "Botão '...' (Opções do Gráfico)")
         
@@ -135,7 +125,6 @@ def extrair_relatorio_metabase():
 
         clicar_js("//button[@data-testid='download-results-button']", "Botão 'Baixar'", delay=1)
         
-        # 6. MONITORIZAÇÃO DE DOWNLOAD (5 MINUTOS)
         print("📥 A aguardar o download em background...")
         tempo_limite = 300 
         arquivo_baixado = None
@@ -148,7 +137,6 @@ def extrair_relatorio_metabase():
                 time.sleep(2) 
                 arquivo_baixado = arquivos_csv[0]
                 break
-                
             time.sleep(1) 
 
         if arquivo_baixado:
@@ -164,11 +152,14 @@ def extrair_relatorio_metabase():
         driver.save_screenshot("erro_log_extracao.png")
 
     finally:
-        driver.switch_to.default_content() 
-        time.sleep(2)
-        driver.quit()
-        print("🏁 Navegador encerrado.")
-        return sucesso
+        try:
+            driver.switch_to.default_content() 
+            time.sleep(2)
+            driver.quit()
+            print("🏁 Navegador encerrado.")
+        except: pass
+            
+    return sucesso
 
 # ==========================================
 # 4. MÓDULO DE TRATAMENTO DE DADOS (PANDAS)
@@ -190,6 +181,29 @@ def analisar_e_limpar_dados():
         dt_resposta = pd.to_datetime(df.get('Data de primeira resposta'), errors='coerce').dt.tz_localize(None)
         dt_fim = pd.to_datetime(df.get('Data de finalização do chat'), errors='coerce').dt.tz_localize(None)
 
+        # -----------------------------------------------------------------
+        # REGRA: ATENDENTE E FECHADO POR (Nome, Sobrenome ou "Não informado")
+        # -----------------------------------------------------------------
+        def formatar_nome_simples(nome):
+            if pd.isna(nome) or str(nome).strip() in ['', 'null', 'None']:
+                return "Não informado"
+            partes = str(nome).strip().split()
+            if len(partes) == 1: return partes[0]
+            return f"{partes[0]} {partes[-1]}"
+            
+        if 'Atendente' in df.columns:
+            df['Atendente'] = df['Atendente'].apply(formatar_nome_simples)
+        else:
+            df['Atendente'] = "Não informado"
+
+        if 'Fechado por' in df.columns:
+            df['Fechado por'] = df['Fechado por'].apply(formatar_nome_simples)
+        else:
+            df['Fechado por'] = "Não informado"
+
+        # -----------------------------------------------------------------
+        # PERÍODO DO DIA E EXPEDIENTE
+        # -----------------------------------------------------------------
         horas = dt_chegada.dt.hour
         df['Período do Dia'] = np.select(
             [(horas >= 0) & (horas < 6), (horas >= 6) & (horas < 12), (horas >= 12) & (horas < 18), (horas >= 18) & (horas <= 23)],
@@ -197,43 +211,40 @@ def analisar_e_limpar_dados():
         )
 
         def verificar_expediente(dt):
-            if pd.isna(dt): return "Desconhecido"
-            if dt.dayofweek >= 5: return "NÃO (Fim de Semana)" 
+            if pd.isna(dt) or dt.dayofweek >= 5: return "Não" 
             minutos_do_dia = dt.hour * 60 + dt.minute
-            if (8 * 60 + 1) <= minutos_do_dia <= (17 * 60 + 59): return "SIM"
-            return "NÃO (Fora do Horário)"
+            if (8 * 60 + 1) <= minutos_do_dia <= (17 * 60 + 59): return "Sim"
+            return "Não"
             
         df['Dentro do Expediente?'] = dt_chegada.apply(verificar_expediente)
 
+        # -----------------------------------------------------------------
+        # AVALIAÇÃO DA ESPERA
+        # -----------------------------------------------------------------
         def avaliar_espera(row, data_chegada, data_resposta, data_fim):
-            if pd.isna(data_resposta): 
-                if pd.isna(data_fim): return "⏳ Na Fila (Ainda em Aberto)"
-                delta_vacuo = (data_fim - data_chegada).total_seconds()
-                if data_fim.date() > data_chegada.date(): return "⚠️ Vácuo até o Dia Seguinte (Fechado sem resposta)"
-                minutos_vacuo = delta_vacuo / 60
-                if pd.isna(row.get('Atendente')) or str(row.get('Atendente')).strip() == '':
-                    return f"🤖 Sistema/Robô (Encerrado após {int(minutos_vacuo)} min)"
-                else: return f"👻 Vácuo Total (Fechado após {int(minutos_vacuo)} min)"
-
-            delta = (data_resposta - data_chegada).total_seconds()
-            if data_resposta.date() > data_chegada.date(): return "⚠️ Passou para o Dia Seguinte"
-            
-            minutos = delta / 60
-            if minutos <= 5: return "🟢 Rápido (< 5 min)"
-            elif minutos <= 15: return "🟡 Aceitável (5 a 15 min)"
-            else: return "🟠 Demorado (> 15 min)"
+            if pd.isna(data_resposta): return "Sem Resposta"
+            minutos = (data_resposta - data_chegada).total_seconds() / 60
+            if minutos <= 5: return "Rapido"
+            elif minutos <= 15: return "Aceitavel"
+            else: return "Demorado"
             
         df['Avaliação da Espera'] = [avaliar_espera(row, c, r, f) for row, c, r, f in zip(df.to_dict('records'), dt_chegada, dt_resposta, dt_fim)]
 
-        def diagnosticar_conversa(row, resp, fim):
-            if pd.isna(row.get('Atendente')): return "🤖 Retido no Robô"
-            if pd.isna(resp): return "👻 Ignorado (Atendente nunca respondeu)"
-            if pd.notna(fim):
-                if (fim - resp).total_seconds() < 60: return "⚡ Fechamento Imediato (Sem diálogo longo)"
-                else: return "✅ Atendimento com Interação"
-            return "⏳ Em Andamento"
+        # -----------------------------------------------------------------
+        # DIAGNÓSTICO DA CONVERSA (Aguardando Atendimento, Sem Interação, Em Atendimento)
+        # -----------------------------------------------------------------
+        def diagnosticar_conversa(resp, fim):
+            if pd.isna(resp):
+                # Se não houve resposta e ainda não foi fechado
+                if pd.isna(fim): return "Aguardando Atendimento"
+                # Se não houve resposta e já foi fechado (Robô, Vácuo, etc)
+                else: return "Sem Interação"
+            else:
+                # Se já teve resposta humana, o status é "Em Atendimento" (independente de estar fechado ou não, conforme solicitado)
+                return "Em Atendimento"
 
-        df['Diagnóstico da Conversa'] = [diagnosticar_conversa(row, r, f) for row, r, f in zip(df.to_dict('records'), dt_resposta, dt_fim)]
+        df['Diagnóstico da Conversa'] = [diagnosticar_conversa(r, f) for r, f in zip(dt_resposta, dt_fim)]
+        
         df['Status Final'] = np.where(dt_fim.notna(), "Encerrado", "Em Aberto")
 
         data_limite_espera = dt_resposta.fillna(dt_fim)
@@ -280,7 +291,6 @@ def analisar_e_limpar_dados():
             ws.write_row(0, 0, df_final.columns)
 
         ws.ignore_errors({'number_stored_as_text': 'A1:XFD1048576'})
-
         fmt_hora = workbook.add_format({'num_format': 'hh:mm:ss'})
         fmt_central = workbook.add_format({'align': 'center'})
 
@@ -304,10 +314,5 @@ def analisar_e_limpar_dados():
 # ==========================================
 if __name__ == "__main__":
     limpar_pasta_downloads()
-    
-    sucesso_download = extrair_relatorio_metabase()
-    
-    if sucesso_download:
-        analisar_e_limpar_dados()
-    else:
-        print("\n⚠️ O tratamento de dados foi cancelado porque o ficheiro CSV não pôde ser descarregado.")
+    if extrair_relatorio_metabase(): analisar_e_limpar_dados()
+    else: print("\n⚠️ O tratamento de dados foi cancelado porque o ficheiro CSV não pôde ser descarregado.")
